@@ -34,6 +34,23 @@ between reads) that produces the position on screen. Squares covered by arrows a
 If the screen jumps in a way no moves explain (analysis navigation, takebacks), the position
 is simply re-read from the screen.
 
+Engine strength: tick off "Full strength" and drag the "Stockfish Elo" slider to make
+Stockfish play (and suggest moves) at roughly that rating. The slider can be changed at
+any time, also while tracking; the range is read from your Stockfish build. Below that
+build's own floor (about 1320) the slider keeps going down to ~600: there Stockfish picks
+from its top moves with a growing chance of a random blunder. That part is only an
+approximate rating, not a calibrated one.
+
+Settings (button below the board) has four tabs down the left side: Board, Logic,
+Effects and Misc. Misc also lets the app start in mini mode. The "Last game" buttons
+under the board keep a win/loss record that is saved between sessions.
+
+Mini window (for a single monitor): the "Mini mode" button, or the option to switch
+automatically when tracking starts, hides the big window and shows a small always-on-top
+window with just the best move ("Nf3", or only the target square such as "e5"). Place it
+OFF the chessboard, otherwise it is captured by the screen reader. "Expand" brings the
+full window back.
+
 Hand-editable board (works whenever tracking is stopped):
     * Drag a piece, or click it and then click its destination. Only legal moves
       are accepted; Stockfish analyses the new position and draws the best move.
@@ -66,7 +83,7 @@ import threading
 import time
 import zlib
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 import chess
 import chess.engine
@@ -108,6 +125,23 @@ THEMES = {
 }
 DEFAULT_THEME = "Classic Green"
 PREFS_PATH = os.path.join(os.path.expanduser("~"), ".chess_screen_assistant.json")
+# Default Elo slider range (replaced by the real range reported by your Stockfish build).
+ELO_MIN, ELO_MAX, ELO_DEFAULT = 1320, 3190, 2000
+ELO_BEGINNER_MIN = 600       # lowest slider value (below the engine's floor = handicapped play)
+
+# Falling-leaf outline (unit coordinates, length 2); tips are doubled so they stay pointed.
+LEAF_SHAPE = ((0, -1.0), (0, -1.0), (0.42, -0.62), (0.58, -0.05), (0.42, 0.55),
+              (0, 1.0), (0, 1.0), (-0.42, 0.55), (-0.58, -0.05), (-0.42, -0.62))
+DEFAULT_LEAF_COLOR = "#d9822b"
+
+
+def shade_hex(color, factor):
+    """Lighten/darken a #rrggbb colour (used to give each leaf its own shade)."""
+    try:
+        r, g, b = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    except (ValueError, TypeError, IndexError):
+        r, g, b = 217, 130, 43
+    return "#{:02x}{:02x}{:02x}".format(*(max(0, min(255, int(v * factor))) for v in (r, g, b)))
 
 
 # ==========================================================================
@@ -620,6 +654,9 @@ def format_eval(score, name):
 # ==========================================================================
 # Self-healing Stockfish wrapper
 # ==========================================================================
+_UNSET = object()
+
+
 class EngineHandle:
     """
     Wraps a Stockfish process. If the process dies (python-chess then reports
@@ -631,6 +668,7 @@ class EngineHandle:
         self.path = path
         self.log = log or (lambda msg: None)
         self.engine = None
+        self._applied = _UNSET     # strength currently configured in the engine process
 
     def start(self):
         self.close()
@@ -639,6 +677,55 @@ class EngineHandle:
             # No black console window; also keeps Stockfish alive in a --windowed .exe
             kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
         self.engine = chess.engine.SimpleEngine.popen_uci(self.path, **kwargs)
+        self._applied = _UNSET     # a fresh process starts at full strength
+
+    def elo_range(self):
+        """(min, max) of the engine's UCI_Elo option, or None if it has no such option."""
+        try:
+            opt = self.engine.options.get("UCI_Elo")
+            if opt is not None and opt.min is not None and opt.max is not None:
+                return int(opt.min), int(opt.max)
+        except Exception:
+            pass
+        return None
+
+    def _apply_strength(self, elo):
+        """Make the engine play at `elo` (None = full strength). Only talks to it on change."""
+        if elo == self._applied:
+            return
+        opts = self.engine.options
+        if "UCI_LimitStrength" in opts and "UCI_Elo" in opts:
+            if elo is None:
+                self.engine.configure({"UCI_LimitStrength": False})
+            else:
+                lo, hi = opts["UCI_Elo"].min, opts["UCI_Elo"].max
+                self.engine.configure({"UCI_LimitStrength": True,
+                                       "UCI_Elo": max(lo, min(hi, int(elo)))})
+        elif elo is not None:
+            self.log("This Stockfish build has no Elo limit option; playing at full strength.")
+        self._applied = elo
+
+    def _handicapped(self, board, seconds, elo, floor):
+        """
+        Below the engine's own Elo floor: analyse at full strength with several lines, then
+        sample a move. The lower the Elo, the flatter the sampling and the likelier a purely
+        random legal move. The returned score is still the true evaluation of the position.
+        """
+        t = max(0.0, min(1.0, (floor - elo) / float(max(1, floor - ELO_BEGINNER_MIN))))
+        n = max(1, min(8, board.legal_moves.count()))
+        infos = self.engine.analyse(board, chess.engine.Limit(time=seconds), multipv=n)
+        infos = [i for i in infos if i.get("pv") and i.get("score") is not None]
+        if not infos:
+            return {"pv": [], "score": None}
+        scores = [i["score"].pov(board.turn).score(mate_score=100000) for i in infos]
+        best = max(scores)
+        if random.random() < 0.55 * t ** 1.2:
+            move = random.choice(list(board.legal_moves))
+        else:
+            temp = 40.0 + 260.0 * t                       # centipawns
+            weights = [math.exp(-(best - sc) / temp) for sc in scores]
+            move = random.choices([i["pv"][0] for i in infos], weights)[0]
+        return {"pv": [move], "score": infos[0]["score"]}
 
     def _exit_code(self):
         try:
@@ -646,13 +733,29 @@ class EngineHandle:
         except Exception:
             return "unknown"
 
-    def analyse(self, board, seconds):
+    def analyse(self, board, seconds, elo=None):
+        """
+        Returns a dict with "pv" and "score". With an Elo limit the move comes from play():
+        Stockfish picks its deliberately weakened move only there, while analyse() would
+        still report the full-strength principal variation.
+        """
         last_error = None
         for attempt in (1, 2):
             try:
                 if self.engine is None:
                     self.start()
-                return self.engine.analyse(board, chess.engine.Limit(time=seconds))
+                rng = self.elo_range()
+                floor = rng[0] if rng else ELO_MIN
+                if elo is not None and elo < floor:
+                    self._apply_strength(None)      # analyse at full strength, then handicap
+                    return self._handicapped(board, seconds, elo, floor)
+                self._apply_strength(elo)
+                limit = chess.engine.Limit(time=seconds)
+                if elo is None:
+                    return self.engine.analyse(board, limit)
+                result = self.engine.play(board, limit, info=chess.engine.INFO_SCORE)
+                return {"pv": [result.move] if result.move else [],
+                        "score": result.info.get("score")}
             except Exception as e:  # EngineTerminatedError, timeouts, broken pipes...
                 last_error = e
                 code = self._exit_code() if self.engine is not None else "n/a"
@@ -681,6 +784,7 @@ class Worker(threading.Thread):
         super().__init__(daemon=True)
         self.cfg, self.q, self.stop = cfg, q, stop_evt
         self.exit_reason = None
+        self.last_elo = cfg.get("elo")   # strength the last suggestion was made at
 
     def post(self, *msg):
         self.q.put(msg)
@@ -694,6 +798,9 @@ class Worker(threading.Thread):
             self.post("error", f"Could not start Stockfish: {e}")
             self.post("stopped")
             return
+        rng = engine.elo_range()
+        if rng:
+            self.post("elo_range", *rng)
         try:
             with mss.mss() as sct:
                 self.loop(sct, engine)
@@ -730,10 +837,16 @@ class Worker(threading.Thread):
         if board.turn != c["us"] and not c["both"]:
             self.post("best", None, "Waiting for your opponent to move…")
             return
+        elo = c.get("elo")           # read once: the slider may move while we think
+        self.last_elo = elo
         self.post("status", "Stockfish is thinking…")
-        info = engine.analyse(board, c["think"])
-        best = info["pv"][0]
-        score = info["score"].pov(c["us"])
+        info = engine.analyse(board, c["think"], elo)
+        pv, score = info.get("pv"), info.get("score")
+        if not pv or score is None:
+            self.post("best", None, "No move found.")
+            return
+        best = pv[0]
+        score = score.pov(c["us"])
         ev = format_eval(score, "White" if c["us"] == chess.WHITE else "Black")
         self.post("best", (best.uci(), board.san(best), ev), "")
 
@@ -833,6 +946,9 @@ class Worker(threading.Thread):
                                          "covering the board?")
                         status = f"{now}  Can't read a valid position — tracking continues."
 
+            if c.get("elo") != self.last_elo and not board.is_game_over():
+                self.suggest(engine, board)   # the Elo slider moved: suggest again
+
             if board.is_game_over():
                 self.exit_reason = f"Game over: {board.result()}"
                 self.post("status", self.exit_reason)
@@ -923,8 +1039,8 @@ class AnalysisService(threading.Thread):
         self.path, self.out = engine_path, out_q
         self.req = queue.Queue()
 
-    def request(self, req_id, fen, think, us):
-        self.req.put((req_id, fen, think, us))
+    def request(self, req_id, fen, think, us, elo=None):
+        self.req.put((req_id, fen, think, us, elo))
 
     def shutdown(self):
         self.req.put(None)
@@ -936,6 +1052,9 @@ class AnalysisService(threading.Thread):
         except Exception as e:
             self.out.put(("manual_error", f"Could not start Stockfish: {e}"))
             return
+        rng = engine.elo_range()
+        if rng:
+            self.out.put(("elo_range", *rng))
         try:
             while True:
                 item = self.req.get()
@@ -948,10 +1067,10 @@ class AnalysisService(threading.Thread):
                 if item is None:
                     break
 
-                req_id, fen, think, us = item
+                req_id, fen, think, us, elo = item
                 board = chess.Board(fen)
                 try:
-                    info = engine.analyse(board, think)
+                    info = engine.analyse(board, think, elo)
                 except Exception as e:  # keep the service alive after a failed search
                     self.out.put(("manual_error", f"{e}"))
                     continue
@@ -1047,6 +1166,28 @@ class App:
         self.arrow_var = tk.BooleanVar(value=True)
         self.hl_best_var = tk.BooleanVar(value=True)
         self.fx_particles = []
+        self.elo_var = tk.DoubleVar(value=ELO_DEFAULT)
+        self.full_strength_var = tk.BooleanVar(value=True)
+        self.elo_display_var = tk.StringVar()
+        self.elo_min, self.elo_max = ELO_BEGINNER_MIN, ELO_MAX   # slider range
+        self.engine_elo_min = ELO_MIN                            # the engine's own floor
+        self._elo_job = None
+        self.dest_only_var = tk.BooleanVar(value=False)    # mini window: show only "e5"
+        self.auto_mini_var = tk.BooleanVar(value=True)     # go mini when tracking starts
+        self.mini_win = None
+        self.mini_geom = None
+        self.mini_big_var = tk.StringVar(value="—")
+        self.mini_small_var = tk.StringVar()
+        self.start_mode_var = tk.StringVar(value="default")   # "default" or "mini"
+        self.leaves_var = tk.BooleanVar(value=False)
+        self.leaf_amount_var = tk.DoubleVar(value=25)
+        self.leaf_color_var = tk.StringVar(value=DEFAULT_LEAF_COLOR)
+        self.leaf_swatch = None
+        self.auto_play_cb = None             # lives in Settings > Misc while that window is open
+        self.settings_lock_widgets = []      # Settings widgets locked while tracking
+        self.results = []                    # game results, "W" / "L", oldest first
+        self.result_var = tk.StringVar()
+        self.record_var = tk.StringVar()
         self.settings_win = None
         self.theme_preview = None
         self.fx_overlay = None
@@ -1067,6 +1208,8 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.pump()
         self.fx_tick()
+        if self.start_mode_var.get() == "mini":
+            root.after(300, self.open_mini)
 
     def configure_ui_style(self):
         """Apply the gray UI palette and native rounded corners where supported."""
@@ -1153,6 +1296,18 @@ class App:
         style.map("TCheckbutton", background=[("active", c["window"])],
                   foreground=[("disabled", c["muted"])])
         style.configure("TRadiobutton", background=c["window"], foreground=c["text"])
+        style.configure("TNotebook", background=c["window"], bordercolor=c["window"],
+                        lightcolor=c["window"], darkcolor=c["window"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=c["surface"], foreground=c["text"],
+                        padding=(18, 8), bordercolor=c["window"],
+                        lightcolor=c["surface"], darkcolor=c["surface"])
+        style.map("TNotebook.Tab",
+                  background=[("selected", c["field"]), ("active", c["hover"])],
+                  lightcolor=[("selected", c["field"])], darkcolor=[("selected", c["field"])])
+        try:
+            style.configure("Settings.TNotebook", tabposition="wn")   # tabs stacked on the left
+        except tk.TclError:
+            pass
         style.map("TRadiobutton", background=[("active", c["window"])])
         style.configure("TEntry", fieldbackground=c["field"], foreground=c["text"],
                         insertcolor=c["text"], bordercolor=c["field"])
@@ -1242,8 +1397,13 @@ class App:
         if not self.root.winfo_exists() or not hasattr(self, "right_panel"):
             return
         available_width = (self.root.winfo_width() - self.right_panel.winfo_reqwidth() - 66)
-        available_height = self.root.winfo_height() - 190
-        size = max(280, min(900, available_width, available_height))
+        # Height taken by everything that sits under the board (toolbar, palette, hint text,
+        # game record, status bar) plus window padding, measured from the real widgets.
+        below_board = (self.left_panel.winfo_reqheight() - self.canvas.winfo_reqheight()
+                       + self.status_label.winfo_reqheight() + 8 + 20)
+        below_board += 24            # cushion: the hint text may re-wrap by a line when resized
+        available_height = self.root.winfo_height() - below_board
+        size = max(280, min(1200, available_width, available_height))
         if size == self.board_px:
             return
         self.board_px = size
@@ -1291,6 +1451,7 @@ class App:
         # ---- Left column: board + editing toolbar ----
         left = ttk.Frame(outer)
         left.grid(row=0, column=0, sticky="n")
+        self.left_panel = left
 
         self.canvas = tk.Canvas(left, width=self.board_px, height=self.board_px,
                                 highlightthickness=0, cursor="hand2")
@@ -1309,9 +1470,10 @@ class App:
         self.free_var = tk.BooleanVar(value=False)
         self.free_cb = ttk.Checkbutton(tb, text="Free edit", variable=self.free_var,
                                        command=self.on_free_toggle)
+        self.mini_btn = ttk.Button(tb, text="Mini mode", command=self.open_mini)
         self.settings_btn = ttk.Button(tb, text="Settings", command=self.open_settings)
         for i, w in enumerate((self.reset_btn, self.undo_btn, self.turn_btn, self.free_cb,
-                               self.settings_btn)):
+                               self.mini_btn, self.settings_btn)):
             w.grid(row=0, column=i, padx=3)
 
         # Piece palette (used in Free edit mode)
@@ -1337,10 +1499,23 @@ class App:
                   "piece above and click a square to place it, right-click to remove."),
         )
         self.direction_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
-        self.auto_play_cb = ttk.Checkbutton(
-            left, text="auto play stockfish move (crash backup)",
-            variable=self.auto_play_var, command=self.on_auto_play_toggle)
-        self.auto_play_cb.grid(row=4, column=0, sticky="w", pady=(5, 0))
+
+        gf = ttk.Frame(left)
+        gf.grid(row=4, column=0, sticky="we", pady=(8, 0))
+        self.result_lbl = ttk.Label(gf, textvariable=self.result_var, font=("Helvetica", 11, "bold"))
+        self.result_lbl.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Button(gf, text="I won", width=8,
+                   command=lambda: self.record_result("W")).grid(row=0, column=1)
+        ttk.Button(gf, text="I lost", width=8,
+                   command=lambda: self.record_result("L")).grid(row=0, column=2, padx=6)
+        ttk.Button(gf, text="Undo last", width=9,
+                   command=self.undo_result).grid(row=0, column=3)
+        ttk.Label(gf, textvariable=self.record_var, style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(2, 0))
+        self.refresh_results()
+        ttk.Checkbutton(left, text="Switch to the mini window when tracking starts",
+                        variable=self.auto_mini_var, command=self.save_prefs).grid(
+            row=5, column=0, sticky="w", pady=(3, 0))
 
         # ---- Right column ----
         right = ttk.Frame(outer)
@@ -1375,48 +1550,35 @@ class App:
         rb1.pack(side="left")
         rb2.pack(side="left", padx=8)
 
-        ttk.Label(s, text="Read every (s):").grid(row=2, column=0, sticky="w", **pad)
-        sp1 = ttk.Spinbox(s, from_=1, to=60, increment=1, width=6, textvariable=self.interval_var)
-        sp1.grid(row=2, column=1, sticky="w", **pad)
+        full_cb = ttk.Checkbutton(s, text="Full strength (no Elo limit)",
+                                  variable=self.full_strength_var, command=self.on_elo_change)
+        full_cb.grid(row=2, column=0, columnspan=3, sticky="w", **pad)
 
-        ttk.Label(s, text="Think time (s):").grid(row=3, column=0, sticky="w", **pad)
-        sp2 = ttk.Spinbox(s, from_=0.2, to=30, increment=0.5, width=6, textvariable=self.think_var)
-        sp2.grid(row=3, column=1, sticky="w", **pad)
+        ttk.Label(s, text="Stockfish Elo:").grid(row=3, column=0, sticky="w", **pad)
+        ef = ttk.Frame(s)
+        ef.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
+        self.elo_scale = ttk.Scale(ef, from_=self.elo_min, to=self.elo_max,
+                                   variable=self.elo_var, length=170,
+                                   command=self.on_elo_change)
+        self.elo_scale.pack(side="left")
+        ttk.Label(ef, textvariable=self.elo_display_var, width=19).pack(side="left", padx=(8, 0))
+        self.refresh_elo_ui()
 
-        ttk.Label(s, text="Performance preset:").grid(row=4, column=0, sticky="w", **pad)
-        preset = ttk.Combobox(s, textvariable=self.performance_var,
-                              values=("Potato PC", "Mid PC", "Good PC"),
-                              state="readonly", width=18)
-        preset.grid(row=4, column=1, columnspan=2, sticky="w", **pad)
-        preset.bind("<<ComboboxSelected>>", self.on_performance_preset)
-
-        cb = ttk.Checkbutton(s, text="Show best move for both sides (tracking)",
-                             variable=self.both_var)
-        cb.grid(row=5, column=0, columnspan=3, sticky="w", **pad)
-
-        ttk.Label(s, text="Start FEN (optional):").grid(row=6, column=0, sticky="w", **pad)
+        ttk.Label(s, text="Start FEN (optional):").grid(row=4, column=0, sticky="w", **pad)
         fe = ttk.Entry(s, textvariable=self.fen_var, width=30)
-        fe.grid(row=6, column=1, columnspan=2, sticky="we", **pad)
+        fe.grid(row=4, column=1, columnspan=2, sticky="we", **pad)
 
         ff = ttk.Frame(s)
-        ff.grid(row=7, column=1, columnspan=2, sticky="w", **pad)
+        ff.grid(row=5, column=1, columnspan=2, sticky="w", **pad)
         lf_btn = ttk.Button(ff, text="FEN → board", command=self.on_load_fen)
         bf_btn = ttk.Button(ff, text="Board → FEN", command=self.on_board_to_fen)
         lf_btn.pack(side="left")
         bf_btn.pack(side="left", padx=6)
 
-        ttk.Label(s, text="Piece sensitivity (lower = more):").grid(row=8, column=0, sticky="w", **pad)
-        sp3 = ttk.Spinbox(s, from_=8, to=80, increment=1, width=6, textvariable=self.occ_var)
-        sp3.grid(row=8, column=1, sticky="w", **pad)
-
-        ttk.Label(s, text="Misread tolerance (squares):").grid(row=9, column=0, sticky="w", **pad)
-        sp4 = ttk.Spinbox(s, from_=0, to=4, increment=1, width=6, textvariable=self.tol_var)
-        sp4.grid(row=9, column=1, sticky="w", **pad)
-
         # Widgets that are locked while the screen tracker is running
-        self.config_widgets = [e, b, rb1, rb2, sp1, sp2, cb, fe, lf_btn, bf_btn, sp3, sp4,
-                               self.reset_btn, self.undo_btn, self.turn_btn, self.free_cb,
-                               self.auto_play_cb]
+        # (the read/think/sensitivity settings are in Settings > Logic)
+        self.config_widgets = [e, b, rb1, rb2, fe, lf_btn, bf_btn,
+                               self.reset_btn, self.undo_btn, self.turn_btn, self.free_cb]
 
         # Buttons
         bf = ttk.Frame(right)
@@ -1469,8 +1631,8 @@ class App:
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.status_label = ttk.Label(outer, textvariable=self.status_var, style="Muted.TLabel")
+        self.status_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         self.refresh_palette()
 
@@ -1565,7 +1727,7 @@ class App:
         # On platforms without a click-through overlay, retain the board-local effect.
         if self.fx_canvas is None:
             self.fx_create_items()
-
+        self.refresh_mini()
 
     # ---- themes, preferences, weather effects --------------------------------------------
     def theme(self):
@@ -1586,6 +1748,19 @@ class App:
             self.fx_fps_display_var.set(f"{self.fx_fps_var.get()} FPS")
             self.arrow_var.set(bool(d.get("arrow", True)))
             self.hl_best_var.set(bool(d.get("highlight_best", True)))
+            self.full_strength_var.set(bool(d.get("full_strength", True)))
+            self.dest_only_var.set(bool(d.get("dest_only", False)))
+            if d.get("start_mode") in ("default", "mini"):
+                self.start_mode_var.set(d["start_mode"])
+            self.leaves_var.set(bool(d.get("leaves", False)))
+            self.leaf_amount_var.set(float(max(3, min(100, float(d.get("leaf_amount", 25))))))
+            lc = d.get("leaf_color")
+            if isinstance(lc, str) and len(lc) == 7 and lc.startswith("#"):
+                int(lc[1:], 16)
+                self.leaf_color_var.set(lc)
+            self.results = [x for x in d.get("results", []) if x in ("W", "L")]
+            self.auto_mini_var.set(bool(d.get("auto_mini", True)))
+            self.elo_var.set(float(max(ELO_BEGINNER_MIN, min(ELO_MAX, int(d.get("elo", ELO_DEFAULT))))))
             if d.get("templates"):
                 self.templates = unpack_templates(d["templates"])
         except Exception:
@@ -1609,6 +1784,15 @@ class App:
                     "fx_fps": int(self.fx_fps_var.get()),
                     "arrow": self.arrow_var.get(),
                     "highlight_best": self.hl_best_var.get(),
+                    "elo": int(round(self.elo_var.get())),
+                    "full_strength": self.full_strength_var.get(),
+                    "dest_only": self.dest_only_var.get(),
+                    "start_mode": self.start_mode_var.get(),
+                    "leaves": self.leaves_var.get(),
+                    "leaf_amount": float(self.leaf_amount_var.get()),
+                    "leaf_color": self.leaf_color_var.get(),
+                    "results": list(self.results),
+                    "auto_mini": self.auto_mini_var.get(),
                     "templates": (None if self.templates_is_default() else pack_templates(self.templates)),
                 }, f)
         except Exception:
@@ -1636,6 +1820,9 @@ class App:
                                   y=random.uniform(0, height), vy=random.uniform(300, 450),
                                   vx=-random.uniform(55, 90), length=random.uniform(9, 17),
                                   item=None))
+        if self.leaves_var.get():
+            for _ in range(max(3, int(float(self.leaf_amount_var.get())))):
+                parts.append(self.new_leaf(width, height, anywhere=True))
         self.fx_particles = parts
         self._fx_last_time = time.perf_counter()
         self.fx_create_items()
@@ -1649,6 +1836,13 @@ class App:
                 r = p["r"]
                 p["item"] = c.create_oval(p["x"] - r, p["y"] - r, p["x"] + r, p["y"] + r,
                                           fill="#f4f7fb", outline="#cbd7e6", tags="fx")
+            elif p["kind"] == "leaf":
+                base = self.leaf_color_var.get()
+                p["item"] = c.create_polygon(
+                    self.leaf_points(p), smooth=True, fill=shade_hex(base, p["shade"]),
+                    outline=shade_hex(base, p["shade"] * 0.7), tags="fx")
+                p["vein"] = c.create_line(*self.leaf_vein(p), fill=shade_hex(base, p["shade"] * 0.55),
+                                          width=1, tags="fx")
             else:
                 p["item"] = c.create_line(p["x"], p["y"],
                                           p["x"] + p["vx"] * 0.035,
@@ -1674,6 +1868,17 @@ class App:
                     p["x"] = (p["x"] + width + 10) % (width + 10) - 5
                     r = p["r"]
                     c.coords(p["item"], p["x"] - r, p["y"] - r, p["x"] + r, p["y"] + r)
+                elif p["kind"] == "leaf":
+                    p["phase"] += dt * 1.3
+                    p["angle"] += p["spin"] * dt
+                    p["flip"] += p["flip_speed"] * dt
+                    p["x"] += (p["vx"] + math.sin(p["phase"]) * p["drift"]) * dt
+                    p["y"] += p["vy"] * dt
+                    if p["y"] > height + p["size"] * 2:
+                        p["y"], p["x"] = -p["size"] * 2, random.uniform(0, width)
+                    p["x"] = (p["x"] + width + 40) % (width + 40) - 20
+                    c.coords(p["item"], *self.leaf_points(p))
+                    c.coords(p["vein"], *self.leaf_vein(p))
                 else:
                     p["x"] += p["vx"] * dt
                     p["y"] += p["vy"] * dt
@@ -1683,6 +1888,82 @@ class App:
                              p["x"] + p["vx"] * 0.035, p["y"] + p["length"])
         fps = max(20, min(120, int(self.fx_fps_var.get())))
         self.root.after(max(1, round(1000 / fps)), self.fx_tick)
+
+    def new_leaf(self, width, height, anywhere=False):
+        return dict(kind="leaf", x=random.uniform(0, width),
+                    y=random.uniform(-40, height) if anywhere else random.uniform(-60, -10),
+                    vy=random.uniform(28, 60), vx=random.uniform(-14, 14),
+                    size=random.uniform(7, 13), angle=random.uniform(0, 6.28),
+                    spin=random.uniform(-1.4, 1.4), flip=random.uniform(0, 6.28),
+                    flip_speed=random.uniform(1.0, 2.6), phase=random.uniform(0, 6.28),
+                    drift=random.uniform(12, 28), shade=random.uniform(0.78, 1.18),
+                    item=None, vein=None)
+
+    @staticmethod
+    def _leaf_point(p, ux, uy, squash):
+        x, y = ux * p["size"] * squash, uy * p["size"]
+        ca, sa = math.cos(p["angle"]), math.sin(p["angle"])
+        return p["x"] + x * ca - y * sa, p["y"] + x * sa + y * ca
+
+    def leaf_points(self, p):
+        squash = 0.35 + 0.65 * abs(math.cos(p["flip"]))      # tumbling effect
+        pts = []
+        for ux, uy in LEAF_SHAPE:
+            pts.extend(self._leaf_point(p, ux, uy, squash))
+        return pts
+
+    def leaf_vein(self, p):
+        return (*self._leaf_point(p, 0, -0.9, 1.0), *self._leaf_point(p, 0, 0.9, 1.0))
+
+    def apply_leaf_color(self):
+        """Recolour only the leaves (snow, rain and the UI keep their own colours)."""
+        c = self.fx_canvas or self.canvas
+        base = self.leaf_color_var.get()
+        for p in self.fx_particles:
+            if p["kind"] == "leaf" and p["item"] is not None:
+                c.itemconfigure(p["item"], fill=shade_hex(base, p["shade"]),
+                                outline=shade_hex(base, p["shade"] * 0.7))
+                c.itemconfigure(p["vein"], fill=shade_hex(base, p["shade"] * 0.55))
+
+    def pick_leaf_color(self):
+        win = self.settings_win if (self.settings_win is not None
+                                    and self.settings_win.winfo_exists()) else self.root
+        result = colorchooser.askcolor(color=self.leaf_color_var.get(), parent=win,
+                                       title="Leaf colour")
+        if not result or not result[1]:
+            return
+        self.leaf_color_var.set(result[1])
+        if self.leaf_swatch is not None and self.leaf_swatch.winfo_exists():
+            self.leaf_swatch.configure(background=result[1])
+        self.apply_leaf_color()
+        self.save_prefs()
+
+    # ---- last-game record ---------------------------------------------------------------
+    def refresh_results(self):
+        r = self.results
+        if r:
+            self.result_var.set("Last game: " + ("Won" if r[-1] == "W" else "Lost"))
+            self.result_lbl.configure(foreground="#4fbf6a" if r[-1] == "W" else "#e0605f")
+        else:
+            self.result_var.set("Last game: —")
+            self.result_lbl.configure(foreground=UI_COLORS["text"])
+        self.record_var.set(f"Record: {r.count('W')} W – {r.count('L')} L   ·   "
+                            f"Recent: {' '.join(r[-10:]) or '—'}")
+
+    def record_result(self, result):
+        self.results.append(result)
+        self.refresh_results()
+        self.save_prefs()            # saved straight away so a crash can't lose it
+
+    def undo_result(self):
+        if self.results:
+            self.results.pop()
+            self.refresh_results()
+            self.save_prefs()
+
+    def on_both_toggle(self):
+        if self.worker and self.worker.is_alive():
+            self.worker.cfg["both"] = self.both_var.get()
 
     def on_fx_fps_change(self, value):
         fps = max(20, min(120, int(float(value))))
@@ -1714,6 +1995,135 @@ class App:
         for i in range(8):
             pv.create_rectangle(i * 30, 0, i * 30 + 30, 30, fill=row1[i], outline="")
             pv.create_rectangle(i * 30, 30, i * 30 + 30, 60, fill=row2[i], outline="")
+
+    # ---- mini window (single-monitor use) ---------------------------------------------
+    def mini_text(self):
+        """(big text, small text) shown in the mini window."""
+        mv = self.best_move
+        if mv is None:
+            big = "…" if self.running else self.best_var.get()
+            return big, ("" if self.running else self.best_sub.get())
+        sub = self.best_sub.get()
+        ev = sub.rsplit("eval", 1)[1].strip() if "eval" in sub else ""
+        to_sq = chess.square_name(mv.to_square)
+        if self.dest_only_var.get():
+            return to_sq, ev
+        try:
+            san = self.board.san(mv)
+        except ValueError:
+            san = self.best_var.get()
+        route = f"{chess.square_name(mv.from_square)} → {to_sq}"
+        return san, (f"{route}   ·   {ev}" if ev else route)
+
+    def refresh_mini(self):
+        win = self.mini_win
+        if win is None or not win.winfo_exists():
+            return
+        big, small = self.mini_text()
+        self.mini_big_var.set(big)
+        self.mini_small_var.set(small)
+        self.mini_stop_btn.configure(state="normal" if self.running else "disabled")
+
+    def on_dest_only_toggle(self):
+        self.refresh_mini()
+        self.save_prefs()
+
+    def open_mini(self):
+        """Hide the big window and show a small always-on-top best-move window."""
+        if self.mini_win is not None and self.mini_win.winfo_exists():
+            return
+        win = tk.Toplevel(self.root)
+        self.mini_win = win
+        win.title("Best move")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.configure(background=UI_COLORS["window"])
+        if sys.platform.startswith("win"):
+            win.after_idle(lambda: self.apply_rounded_corners(win))
+            win.after_idle(lambda: self.apply_dark_titlebar(win))
+        win.protocol("WM_DELETE_WINDOW", self.close_mini)
+
+        f = ttk.Frame(win, padding=(14, 8))
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, textvariable=self.mini_big_var, font=("Helvetica", 40, "bold"),
+                  foreground=ARROW, anchor="center", width=9).pack(fill="x")
+        ttk.Label(f, textvariable=self.mini_small_var, anchor="center").pack(fill="x")
+        ttk.Label(f, textvariable=self.status_var, style="Muted.TLabel", wraplength=230,
+                  justify="center", anchor="center").pack(fill="x", pady=(4, 0))
+        row = ttk.Frame(f)
+        row.pack(pady=(8, 0))
+        self.mini_stop_btn = ttk.Button(row, text="Stop", width=8, command=self.on_stop)
+        self.mini_stop_btn.pack(side="left", padx=3)
+        ttk.Button(row, text="Expand", width=8, command=self.close_mini).pack(side="left", padx=3)
+        ttk.Checkbutton(f, text='Square only (just "e5")', variable=self.dest_only_var,
+                        command=self.on_dest_only_toggle).pack(pady=(6, 0))
+
+        win.update_idletasks()
+        if self.mini_geom:
+            win.geometry(self.mini_geom)
+        else:
+            win.geometry(f"+{max(0, win.winfo_screenwidth() - win.winfo_reqwidth() - 30)}+60")
+        self.root.withdraw()
+        self.refresh_mini()
+
+    def close_mini(self):
+        """Back to the full window."""
+        win = self.mini_win
+        if win is not None and win.winfo_exists():
+            self.mini_geom = win.geometry()
+            win.destroy()
+        self.mini_win = None
+        self.root.deiconify()
+        self.root.lift()
+
+    # ---- Stockfish strength (Elo slider) ------------------------------------------------------
+    def current_elo(self):
+        """Elo limit to hand to Stockfish, or None for full strength."""
+        if self.full_strength_var.get():
+            return None
+        return max(self.elo_min, min(self.elo_max, int(round(self.elo_var.get()))))
+
+    def refresh_elo_ui(self):
+        full = self.full_strength_var.get()
+        elo = int(round(self.elo_var.get()))
+        if full:
+            text = "Full strength"
+        elif elo < self.engine_elo_min:
+            text = f"Elo ~{elo} (approx.)"     # handicapped play, not calibrated
+        else:
+            text = f"Elo {elo}"
+        self.elo_display_var.set(text)
+        if hasattr(self, "elo_scale"):
+            self.elo_scale.state(["disabled"] if full else ["!disabled"])
+
+    def on_elo_change(self, value=None):
+        """Slider moved or 'Full strength' toggled. Works while tracking too."""
+        raw = float(value) if value is not None else float(self.elo_var.get())
+        snapped = max(self.elo_min, min(self.elo_max, int(round(raw / 10.0)) * 10))
+        if abs(float(self.elo_var.get()) - snapped) > 1e-6:
+            self.elo_var.set(snapped)          # snap to steps of 10
+        self.refresh_elo_ui()
+        if self.worker and self.worker.is_alive():
+            self.worker.cfg["elo"] = self.current_elo()
+        if self._elo_job is not None:
+            self.root.after_cancel(self._elo_job)
+        self._elo_job = self.root.after(500, self.apply_elo_change)   # wait until it settles
+
+    def apply_elo_change(self):
+        self._elo_job = None
+        self.save_prefs()
+        if not self.running and self.service is not None:
+            self.request_manual_analysis()
+
+    def set_elo_range(self, lo, hi):
+        """Adopt the Elo range that the installed Stockfish build reports."""
+        new_min = min(ELO_BEGINNER_MIN, lo)
+        if lo >= hi or (new_min, hi, lo) == (self.elo_min, self.elo_max, self.engine_elo_min):
+            return
+        self.elo_min, self.elo_max, self.engine_elo_min = new_min, hi, lo
+        self.elo_scale.configure(from_=new_min, to=hi)
+        self.elo_var.set(max(new_min, min(hi, float(self.elo_var.get()))))
+        self.refresh_elo_ui()
 
     def on_performance_preset(self, _event=None, save=True):
         """Apply the selected refresh and engine think-time preset."""
@@ -1750,56 +2160,124 @@ class App:
 
         def close():
             self.save_prefs()
+            self.settings_lock_widgets = []
+            self.auto_play_cb = self.leaf_swatch = self.theme_preview = None
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", close)
-        pad = {"padx": 8, "pady": 4}
-        f = ttk.Frame(win, padding=12)
-        f.pack()
+        pad = {"padx": 8, "pady": 5}
+        head = ("Helvetica", 10, "bold")
+        self.settings_lock_widgets = []
 
-        ttk.Label(f, text="Board theme", font=("Helvetica", 10, "bold")).grid(
-            row=0, column=0, sticky="w", **pad)
-        cb = ttk.Combobox(f, textvariable=self.theme_var, values=list(THEMES),
+        nb = ttk.Notebook(win, style="Settings.TNotebook")
+        nb.pack(padx=10, pady=(10, 0))
+        tabs = {}
+        for name in ("Board", "Logic", "Effects", "Misc"):
+            tabs[name] = ttk.Frame(nb, padding=14)
+            nb.add(tabs[name], text=name)
+
+        # ---- Board ----
+        t = tabs["Board"]
+        ttk.Label(t, text="Board theme", font=head).grid(row=0, column=0, sticky="w", **pad)
+        cb = ttk.Combobox(t, textvariable=self.theme_var, values=list(THEMES),
                           state="readonly", width=18)
         cb.grid(row=0, column=1, sticky="w", **pad)
         cb.bind("<<ComboboxSelected>>", lambda e: self.apply_settings())
-
-        self.theme_preview = tk.Canvas(f, width=240, height=60, highlightthickness=1,
+        self.theme_preview = tk.Canvas(t, width=240, height=60, highlightthickness=1,
                                        highlightbackground=UI_COLORS["border"],
                                        background=UI_COLORS["panel"])
         self.theme_preview.grid(row=1, column=0, columnspan=2, **pad)
         self.draw_theme_preview()
-
-        ttk.Label(f, text="Best move", font=("Helvetica", 10, "bold")).grid(
-            row=2, column=0, sticky="w", **pad)
-        ttk.Checkbutton(f, text="Highlight piece and target square", variable=self.hl_best_var,
+        ttk.Label(t, text="Best move", font=head).grid(row=2, column=0, sticky="w", **pad)
+        ttk.Checkbutton(t, text="Show arrow", variable=self.arrow_var,
                         command=self.apply_settings).grid(row=3, column=0, columnspan=2,
                                                           sticky="w", **pad)
-        ttk.Checkbutton(f, text="Show arrow", variable=self.arrow_var,
+        ttk.Checkbutton(t, text="Highlight piece and target square", variable=self.hl_best_var,
                         command=self.apply_settings).grid(row=4, column=0, columnspan=2,
                                                           sticky="w", **pad)
+        ttk.Checkbutton(t, text="Show best move for both sides (tracking)",
+                        variable=self.both_var, command=self.on_both_toggle).grid(
+            row=5, column=0, columnspan=2, sticky="w", **pad)
 
-        ttk.Label(f, text="Weather effects", font=("Helvetica", 10, "bold")).grid(
-            row=5, column=0, sticky="w", **pad)
-        ttk.Checkbutton(f, text="Falling snow", variable=self.snow_var,
-                        command=self.apply_settings).grid(row=6, column=0, columnspan=2,
+        # ---- Logic ----
+        t = tabs["Logic"]
+        ttk.Label(t, text="Performance preset:").grid(row=0, column=0, sticky="w", **pad)
+        preset = ttk.Combobox(t, textvariable=self.performance_var,
+                              values=("Potato PC", "Mid PC", "Good PC"),
+                              state="readonly", width=18)
+        preset.grid(row=0, column=1, sticky="w", **pad)
+        preset.bind("<<ComboboxSelected>>", self.on_performance_preset)
+        spin_rows = (
+            ("Read every (s):", dict(from_=1, to=60, increment=1), self.interval_var),
+            ("Think time (s):", dict(from_=0.2, to=30, increment=0.5), self.think_var),
+            ("Piece sensitivity (lower = more):", dict(from_=8, to=80, increment=1), self.occ_var),
+            ("Misread tolerance (squares):", dict(from_=0, to=4, increment=1), self.tol_var),
+        )
+        for i, (label, rng, var) in enumerate(spin_rows, start=1):
+            ttk.Label(t, text=label).grid(row=i, column=0, sticky="w", **pad)
+            sp = ttk.Spinbox(t, width=6, textvariable=var, **rng)
+            sp.grid(row=i, column=1, sticky="w", **pad)
+            sp.configure(state="disabled" if self.running else "normal")
+            self.settings_lock_widgets.append(sp)
+        ttk.Label(t, text="These four are locked while tracking is running.",
+                  style="Muted.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+
+        # ---- Effects ----
+        t = tabs["Effects"]
+        ttk.Label(t, text="Weather effects", font=head).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Checkbutton(t, text="Falling snow", variable=self.snow_var,
+                        command=self.apply_settings).grid(row=1, column=0, columnspan=3,
                                                           sticky="w", **pad)
-        ttk.Checkbutton(f, text="Rain", variable=self.rain_var,
-                        command=self.apply_settings).grid(row=7, column=0, columnspan=2,
+        ttk.Checkbutton(t, text="Rain", variable=self.rain_var,
+                        command=self.apply_settings).grid(row=2, column=0, columnspan=3,
                                                           sticky="w", **pad)
-        ttk.Label(f, text="Amount").grid(row=8, column=0, sticky="w", **pad)
-        ttk.Scale(f, from_=10, to=200, variable=self.fx_amount_var, length=140,
+        ttk.Label(t, text="Amount").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Scale(t, from_=10, to=200, variable=self.fx_amount_var, length=140,
                   command=lambda v: self.apply_settings(save=False)).grid(
-            row=8, column=1, sticky="w", **pad)
+            row=3, column=1, sticky="w", **pad)
+        ttk.Label(t, text="Animation FPS").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Scale(t, from_=20, to=120, variable=self.fx_fps_var, length=140,
+                  command=self.on_fx_fps_change).grid(row=4, column=1, sticky="w", **pad)
+        ttk.Label(t, textvariable=self.fx_fps_display_var, width=7).grid(
+            row=4, column=2, sticky="w", **pad)
 
-        ttk.Label(f, text="Animation FPS").grid(row=9, column=0, sticky="w", **pad)
-        ttk.Scale(f, from_=20, to=120, variable=self.fx_fps_var, length=140,
-                  command=self.on_fx_fps_change).grid(row=9, column=1, sticky="w", **pad)
-        ttk.Label(f, textvariable=self.fx_fps_display_var, width=7).grid(
-            row=9, column=2, sticky="w", **pad)
+        ttk.Label(t, text="Falling leaves", font=head).grid(row=5, column=0, sticky="w",
+                                                            padx=8, pady=(14, 5))
+        ttk.Checkbutton(t, text="Falling leaves", variable=self.leaves_var,
+                        command=self.apply_settings).grid(row=6, column=0, columnspan=3,
+                                                          sticky="w", **pad)
+        ttk.Label(t, text="Leaf amount").grid(row=7, column=0, sticky="w", **pad)
+        ttk.Scale(t, from_=3, to=100, variable=self.leaf_amount_var, length=140,
+                  command=lambda v: self.apply_settings(save=False)).grid(
+            row=7, column=1, sticky="w", **pad)
+        ttk.Label(t, text="Leaf colour").grid(row=8, column=0, sticky="w", **pad)
+        lc = ttk.Frame(t)
+        lc.grid(row=8, column=1, columnspan=2, sticky="w", **pad)
+        self.leaf_swatch = tk.Label(lc, width=4, relief="solid", bd=1,
+                                    background=self.leaf_color_var.get())
+        self.leaf_swatch.pack(side="left")
+        ttk.Button(lc, text="Choose colour…", command=self.pick_leaf_color).pack(
+            side="left", padx=8)
 
-        ttk.Button(f, text="Close", command=close).grid(row=10, column=0,
-                                                          columnspan=3, pady=(10, 0))
+        # ---- Misc ----
+        t = tabs["Misc"]
+        ttk.Label(t, text="When the app starts", font=head).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Radiobutton(t, text="Default mode (full window)", variable=self.start_mode_var,
+                        value="default", command=self.save_prefs).grid(
+            row=1, column=0, sticky="w", **pad)
+        ttk.Radiobutton(t, text="Mini mode (small best-move window)",
+                        variable=self.start_mode_var, value="mini",
+                        command=self.save_prefs).grid(row=2, column=0, sticky="w", **pad)
+        ttk.Label(t, text="Study board", font=head).grid(row=3, column=0, sticky="w",
+                                                         padx=8, pady=(14, 5))
+        self.auto_play_cb = ttk.Checkbutton(
+            t, text="Auto play Stockfish move (crash backup)",
+            variable=self.auto_play_var, command=self.on_auto_play_toggle,
+            state="disabled" if self.running else "normal")
+        self.auto_play_cb.grid(row=4, column=0, sticky="w", **pad)
+        self.settings_lock_widgets.append(self.auto_play_cb)
+
+        ttk.Button(win, text="Close", command=close).pack(pady=10)
 
     # ---- small helpers -------------------------------------------------------------------
     def log(self, text):
@@ -1835,8 +2313,14 @@ class App:
         for w in self.config_widgets + [self.auto_btn, self.select_btn, self.test_btn,
                                         self.learn_btn, self.start_btn]:
             w.configure(state="disabled" if running else "normal")
+        for w in list(self.settings_lock_widgets):      # widgets in the Settings window
+            try:
+                w.configure(state="disabled" if running else "normal")
+            except tk.TclError:
+                pass
         self.stop_btn.configure(state="normal" if running else "disabled")
         self.canvas.configure(cursor="arrow" if running else "hand2")
+        self.refresh_mini()
 
     def on_auto_play_toggle(self):
         """Enable Stockfish auto-play on the app's internal board only."""
@@ -1915,7 +2399,7 @@ class App:
         self.best_var.set("…")
         self.best_sub.set("Analysing…")
         us = chess.BLACK if self.color_var.get() == "black" else chess.WHITE
-        self.service.request(self.req_id, self.board.fen(), think, us)
+        self.service.request(self.req_id, self.board.fen(), think, us, self.current_elo())
 
     def can_edit(self):
         if self.running:
@@ -2268,6 +2752,7 @@ class App:
                 "us": chess.BLACK if self.color_var.get() == "black" else chess.WHITE,
                 "interval": max(1.0, float(self.interval_var.get())),
                 "think": max(0.1, float(self.think_var.get())),
+                "elo": self.current_elo(),
                 "both": self.both_var.get(),
                 "fen": fen,
                 "fg_threshold": float(self.occ_var.get()),
@@ -2295,6 +2780,8 @@ class App:
         self.worker.start()
         self.set_running(True)
         self.log("Started.")
+        if self.auto_mini_var.get():
+            self.open_mini()
 
     def on_stop(self):
         if self.stop_evt:
@@ -2321,6 +2808,8 @@ class App:
                     self.status_var.set(data[0])
                 elif kind == "log":
                     self.log(data[0])
+                elif kind == "elo_range":
+                    self.set_elo_range(*data)
                 elif kind == "error":
                     self.log("ERROR: " + data[0])
                     messagebox.showerror("Error", data[0])
