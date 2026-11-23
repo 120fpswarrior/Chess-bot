@@ -8,6 +8,7 @@ Make sure you download stockfish 19 from https://github.com/official-stockfish/S
 
 Download the .py and .bat file, then run the .bat file. 
 You will see 2 folders, build and dist. Open dist, then you need to drop 4 things into the dist folder: 
+
 -stockfish.exe
 
 -the "wiki" folder
