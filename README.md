@@ -24,7 +24,11 @@ Then, click "Test read" to test if the bot can read the board.
 To start the game, click "Start". The tool will automatically run stockfish and give you the best moves. 
 
 As of 23 november of 2026, there are a lot of new features, main ones being: 
+
 -A slider to adjust the elo stockfish thinks at, keep this about 150-200 elo above your chess.com elo, as you will get banned for playing like Magnus on a 2 day old account!!
-Last game result button, dont win too much in a row as that will also ban you. 
+
+-Last game result button, dont win too much in a row as that will also ban you. 
+
 -Mini mode, makes the window tiny and just shows the best move as a text. 
-Compact UI, settings are moved to the actual settings menu. 
+
+-Compacter UI, settings are moved to the actual settings menu. 
