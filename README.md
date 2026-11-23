@@ -1,4 +1,5 @@
 # Chess-bot
+this is 100% vibecoded fyi
 A tool that scans your screen for any chess games that analyses the board and gives the best moves live. I recommend to use a second monitor for the tool
 
 Make sure you download stockfish 19 from https://github.com/official-stockfish/Stockfish/archive/refs/tags/sf_19.zip or https://stockfishchess.org/download/
